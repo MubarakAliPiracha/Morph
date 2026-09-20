@@ -8,8 +8,11 @@ Only the simulator behind `session` is new.
 import math
 import os
 import re
-from pathlib import Path
-from typing import Dict, List
+import signal
+import threading
+import time
+from pathlib import Path, PurePosixPath
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -168,35 +171,116 @@ def select_robot(body: SelectBody) -> Dict:
     return info
 
 
-def rewrite_unresolvable_finds(xacro_text: str, fallback_dir: Path) -> str:
-    """Point $(find <pkg>) at the upload folder when <pkg> is not an installed package.
+MAX_UPLOAD_BYTES = 300 * 1024 * 1024
+ACTIVE_ROBOT_FILE = Path("/sim/models/.active_robot")
+UPLOAD_ID_RE = re.compile(r"^upload_[0-9a-f]{8}$")
+
+
+def safe_relative_path(name: str) -> Optional[Path]:
+    """A browser filename or zip entry as a path that cannot escape the upload dir."""
+    parts = [p for p in PurePosixPath(name.replace("\\", "/")).parts
+             if p not in ("", ".", "/")]
+    if not parts or any(p == ".." for p in parts) or parts[0].endswith(":"):
+        return None
+    return Path(*parts)
+
+
+def extract_zip(data: bytes, dest: Path) -> None:
+    import io
+    import zipfile
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(422, "That .zip file could not be read.")
+    total = 0
+    with archive:
+        for member in archive.infolist():
+            if member.is_dir():
+                continue
+            rel = safe_relative_path(member.filename)
+            if rel is None:
+                continue
+            total += member.file_size
+            if total > MAX_UPLOAD_BYTES:
+                raise HTTPException(422, "Archive too large (300 MB limit).")
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as src:
+                target.write_bytes(src.read())
+
+
+def rewrite_unresolvable_finds(xacro_text: str, upload_root: Path) -> str:
+    """Point $(find <pkg>) somewhere useful when <pkg> is not an installed package.
 
     Exported URDFs reference their own source package, which is never installed in this
     container; installed packages (e.g. turtlebot3_description) still resolve normally.
+    A folder in the upload named like the package is the package, so prefer it.
     ament import stays local so the module keeps importing outside the ROS environment.
     """
     from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 
     def substitute(match: "re.Match[str]") -> str:
+        pkg = match.group(1)
         try:
-            get_package_share_directory(match.group(1))
+            get_package_share_directory(pkg)
             return match.group(0)
         except PackageNotFoundError:
-            return str(fallback_dir)
+            nested = upload_root / pkg
+            return str(nested if nested.is_dir() else upload_root)
 
     return re.sub(r"\$\(find\s+([^)\s]+)\s*\)", substitute, xacro_text)
+
+
+def best_robot_description(raw_dir: Path) -> Tuple[Optional[Path], List[str]]:
+    """Convert every candidate and keep the one that declares the most links.
+
+    A zip or folder upload holds macro/include xacros alongside the real robot; the
+    include-only files convert fine but produce zero links, so link count -- not file
+    order -- is what identifies the actual robot. Returns (urdf_path, notes)."""
+    import subprocess
+    import xml.etree.ElementTree as ET
+
+    for xacro_file in raw_dir.rglob("*.xacro"):
+        text = xacro_file.read_text(encoding="utf-8", errors="replace")
+        rewritten = rewrite_unresolvable_finds(text, raw_dir)
+        if rewritten != text:  # in place: included files need the rewrite too
+            xacro_file.write_text(rewritten)
+
+    best, best_links, notes = None, 0, []
+    for path in sorted(raw_dir.rglob("*")):
+        if path.suffix.lower() not in (".urdf", ".xacro"):
+            continue
+        if path.name.endswith(".converted.urdf"):
+            continue
+        if path.suffix.lower() == ".xacro":
+            done = subprocess.run(["xacro", str(path)], capture_output=True, text=True)
+            if done.returncode != 0:
+                notes.append(f"{path.name}: xacro failed: {done.stderr.strip()[:200]}")
+                continue
+            candidate = path.with_name(path.stem + ".converted.urdf")
+            candidate.write_text(done.stdout)
+        else:
+            candidate = path
+        try:
+            links = len(ET.parse(candidate).getroot().findall("link"))
+        except ET.ParseError as exc:
+            notes.append(f"{path.name}: not valid XML: {exc}")
+            continue
+        if links > best_links:
+            best, best_links = candidate, links
+    return best, notes
 
 
 @app.post("/api/robot/upload")
 async def upload_robot(files: List[UploadFile] = File(...)) -> Dict:
     """Run the uploaded robot through the same converter that imported the TurtleBot3.
 
-    The pipeline strips Gazebo-Classic plugins, retargets ros2_control to the sim,
-    converts sensors to Fortress naming, and reports every sensor it found. Activating
-    the robot needs a container restart (the controller stack is instantiated at boot),
-    so the response says exactly how.
+    Accepts loose files, a folder, or a .zip of either. The pipeline strips
+    Gazebo-Classic plugins, retargets ros2_control to the sim, converts sensors to
+    Fortress naming, and reports every sensor it found. The response carries
+    `upload_id`; POST it to /api/robot/activate to reboot the sim into this robot.
     """
-    import subprocess
     import sys
     import uuid
 
@@ -205,29 +289,26 @@ async def upload_robot(files: List[UploadFile] = File(...)) -> Dict:
     raw_dir = Path("/sim/models") / upload_id / "_raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    urdf_path = None
+    received = 0
     for f in files:
-        name = Path(f.filename or "file").name
-        dest = raw_dir / name
-        dest.write_bytes(await f.read())
-        if name.endswith(".xacro"):
-            resolved = raw_dir / (name + ".resolved")
-            resolved.write_text(
-                rewrite_unresolvable_finds(
-                    dest.read_text(encoding="utf-8", errors="replace"), raw_dir
-                )
-            )
-            converted = raw_dir / (name.rsplit(".", 1)[0] + ".converted.urdf")
-            done = subprocess.run(["xacro", str(resolved)], capture_output=True, text=True)
-            if done.returncode == 0:
-                converted.write_text(done.stdout)
-                urdf_path = converted
-            else:
-                raise HTTPException(422, f"xacro failed: {done.stderr[:300]}")
-        elif name.endswith(".urdf") and urdf_path is None:
-            urdf_path = dest
+        rel = safe_relative_path(f.filename or "file")
+        if rel is None:
+            continue
+        data = await f.read()
+        received += len(data)
+        if received > MAX_UPLOAD_BYTES:
+            raise HTTPException(422, "Upload too large (300 MB limit).")
+        if rel.suffix.lower() == ".zip":
+            extract_zip(data, raw_dir)
+            continue
+        dest = raw_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+
+    urdf_path, notes = best_robot_description(raw_dir)
     if urdf_path is None:
-        raise HTTPException(422, "No .urdf or .xacro file in the upload.")
+        detail = "No usable robot description in the upload."
+        raise HTTPException(422, " ".join([detail] + notes[:3]))
 
     try:
         import import_robot as importer
@@ -235,7 +316,8 @@ async def upload_robot(files: List[UploadFile] = File(...)) -> Dict:
         from contextlib import redirect_stdout
         report = io.StringIO()
         with redirect_stdout(report):
-            sys.argv = ["import_robot", str(urdf_path), f"/sim/models/{upload_id}", upload_id]
+            sys.argv = ["import_robot", str(urdf_path),
+                        f"/sim/models/{upload_id}", upload_id, str(raw_dir)]
             importer.main()
     except Exception as exc:
         raise HTTPException(422, f"Robot conversion failed: {exc}")
@@ -245,14 +327,41 @@ async def upload_robot(files: List[UploadFile] = File(...)) -> Dict:
     sensor_names = [f"{s['type']} on {s['link']}" for s in uploaded.sensors] or ["none declared"]
 
     info = session.robot_info()
+    info["upload_id"] = upload_id
     info["warnings"] = [
         f"Converted for Gazebo Fortress as '{upload_id}': "
         f"{len(uploaded.movable)} movable joints, wheels {uploaded.wheels or 'none'}, "
-        f"sensors: {', '.join(sensor_names)}. "
-        f"To drive it, set NLROBOT_ROBOT={upload_id} in docker-compose.yml and restart "
-        "(the controller stack is built at boot). Until then the current robot stays active."
-    ]
+        f"sensors: {', '.join(sensor_names)}."
+    ] + notes
     return info
+
+
+class ActivateBody(BaseModel):
+    source: str
+
+
+@app.post("/api/robot/activate")
+def activate_robot(body: ActivateBody) -> Dict:
+    """Reboot the simulator with the chosen robot.
+
+    The controller stack is instantiated at container boot, so switching robots means
+    restarting the container: record the selection where the entrypoint reads it,
+    answer this request, then signal PID 1. docker-compose `restart: unless-stopped`
+    brings the container straight back up; a broken selection falls back to tb3 there.
+    """
+    source = body.source.strip()
+    if source != "tb3" and not UPLOAD_ID_RE.match(source):
+        raise HTTPException(422, f"Unknown robot '{source}'.")
+    if source != "tb3" and not Path(f"/sim/models/{source}/{source}.urdf").is_file():
+        raise HTTPException(422, f"No converted model named '{source}' on this sim.")
+    ACTIVE_ROBOT_FILE.write_text(source)
+
+    def reboot() -> None:
+        time.sleep(1.0)  # let the HTTP response leave first
+        os.kill(1, signal.SIGTERM)
+
+    threading.Thread(target=reboot, daemon=True, name="robot-activate-reboot").start()
+    return {"ok": True, "source": source, "rebooting": True}
 
 
 @app.post("/api/robot/reset")
