@@ -7,6 +7,7 @@ Only the simulator behind `session` is new.
 
 import math
 import os
+import re
 from pathlib import Path
 from typing import Dict, List
 
@@ -22,6 +23,7 @@ import asyncio
 import json
 
 import llm
+import nav
 import skills
 import world_ops
 from session import Session
@@ -166,6 +168,25 @@ def select_robot(body: SelectBody) -> Dict:
     return info
 
 
+def rewrite_unresolvable_finds(xacro_text: str, fallback_dir: Path) -> str:
+    """Point $(find <pkg>) at the upload folder when <pkg> is not an installed package.
+
+    Exported URDFs reference their own source package, which is never installed in this
+    container; installed packages (e.g. turtlebot3_description) still resolve normally.
+    ament import stays local so the module keeps importing outside the ROS environment.
+    """
+    from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
+
+    def substitute(match: "re.Match[str]") -> str:
+        try:
+            get_package_share_directory(match.group(1))
+            return match.group(0)
+        except PackageNotFoundError:
+            return str(fallback_dir)
+
+    return re.sub(r"\$\(find\s+([^)\s]+)\s*\)", substitute, xacro_text)
+
+
 @app.post("/api/robot/upload")
 async def upload_robot(files: List[UploadFile] = File(...)) -> Dict:
     """Run the uploaded robot through the same converter that imported the TurtleBot3.
@@ -190,8 +211,14 @@ async def upload_robot(files: List[UploadFile] = File(...)) -> Dict:
         dest = raw_dir / name
         dest.write_bytes(await f.read())
         if name.endswith(".xacro"):
+            resolved = raw_dir / (name + ".resolved")
+            resolved.write_text(
+                rewrite_unresolvable_finds(
+                    dest.read_text(encoding="utf-8", errors="replace"), raw_dir
+                )
+            )
             converted = raw_dir / (name.rsplit(".", 1)[0] + ".converted.urdf")
-            done = subprocess.run(["xacro", str(dest)], capture_output=True, text=True)
+            done = subprocess.run(["xacro", str(resolved)], capture_output=True, text=True)
             if done.returncode == 0:
                 converted.write_text(done.stdout)
                 urdf_path = converted
@@ -243,6 +270,35 @@ def put_world(body: WorldBody) -> Dict:
     return {"ok": True}
 
 
+def unreachable_warnings(actions: List[Dict]) -> List[str]:
+    """Flag go_to goals no traversable route reaches, before the robot even moves.
+
+    This is how an LLM-built maze with no entrance surfaces as an honest sentence in
+    chat instead of a robot silently nosing a wall for ninety seconds.
+    """
+    out: List[str] = []
+    world = session.scan_world()
+    x, y, _ = session.state.base_2d()
+    for action in actions:
+        if action["primitive"] != "go_to":
+            continue
+        params = action["params"]
+        target_obj = next((o for o in world if o["id"] == params.get("target_id")), None)
+        route = nav.plan_path(
+            world, (x, y), (params["x"], params["y"]),
+            session.executor.inflate, session.vehicle.height,
+            target_obj=target_obj, stop_distance=params.get("stop_distance", 0.0),
+        )
+        if route is None:
+            out.append(
+                f"No traversable route to ({params['x']:.1f}, {params['y']:.1f}) exists in "
+                "this world - the robot will get as close as it can. Check for sealed walls."
+            )
+        else:
+            x, y = route[-1]  # later steps start from where this one ends
+    return out
+
+
 class CommandBody(BaseModel):
     text: str
     mode: str = "robot"
@@ -291,11 +347,12 @@ def command(body: CommandBody) -> Dict:
         plan.get("steps") or [],
         True,
         session.joints,
-        session.world_snapshot(),
+        session.scan_world(),  # live poses: a pushed crate is where physics left it
         session.wheel_names,
         has_gripper=bool(session.gripper),
     )
     warnings += skill_warnings
+    warnings += unreachable_warnings(actions)
     reply = str(plan.get("reply") or "").strip() or None
     repeat = bool(plan.get("repeat"))
     if map_mode:
@@ -320,6 +377,56 @@ def command(body: CommandBody) -> Dict:
         "ok": True, "source": source, "reply": reply, "plan": actions, "repeat": repeat,
         "world": session.world_snapshot() if world_changed else None,
         "warnings": warnings, "llm": llm.status(), "llm_error": llm_error, "path": path,
+    }
+
+
+class PlanBody(BaseModel):
+    steps: List[Dict]
+    repeat: bool = False
+
+
+@app.post("/api/plan")
+def plan_direct(body: PlanBody) -> Dict:
+    """Submit validated steps directly, skipping the LLM.
+
+    Same validation and execution path as /api/command; exists so tests and scripts can
+    exercise the executor deterministically.
+    """
+    actions, warnings = skills.normalize(
+        body.steps,
+        True,
+        session.joints,
+        session.scan_world(),
+        session.wheel_names,
+        has_gripper=bool(session.gripper),
+    )
+    if not actions:
+        raise HTTPException(422, "Nothing runnable came out of that. " + " ".join(warnings))
+    session.submit(actions, body.repeat)
+    return {"ok": True, "plan": actions, "warnings": warnings,
+            "path": session.vehicle.preview(actions)}
+
+
+@app.get("/api/state")
+def get_state() -> Dict:
+    """Live pose, executor status and world readback for tests and scripts.
+
+    `pose` is the odometry frame every controller runs on; `pose_truth` is Gazebo's
+    ground-truth model pose when available -- the difference between them is odometry
+    drift, worth watching whenever the robot touches something.
+    """
+    queued, active = session.executor.status()
+    x, y, yaw = session.state.base_2d()
+    ox, oy, oyaw = session.state.odom_2d()
+    return {
+        "pose": {"x": round(x, 4), "y": round(y, 4), "yaw": round(yaw, 4)},
+        "pose_odom": {"x": round(ox, 4), "y": round(oy, 4), "yaw": round(oyaw, 4)},
+        "drift": round(math.dist((x, y), (ox, oy)), 3),
+        "queued": queued,
+        "active": active,
+        "front": session.sensor_block()["front"],
+        "held": session.executor.held_id,
+        "world": session.scan_world(),
     }
 
 
