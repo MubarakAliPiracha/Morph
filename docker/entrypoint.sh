@@ -11,8 +11,30 @@ set -e
 source /opt/ros/humble/setup.bash
 
 WORLD="${NLROBOT_WORLD:-nlworld}"
-ROBOT="${NLROBOT_ROBOT:-tb3}"
+
+# Robot selection: env var wins, then the marker /api/robot/activate writes, then tb3.
+# The marker is arbitrary file content headed into paths and sed, so it is validated
+# against the exact shapes the server can write, and anything else is ignored.
+ROBOT="${NLROBOT_ROBOT:-}"
+ACTIVE_FILE=/sim/models/.active_robot
+if [ -z "$ROBOT" ] && [ -f "$ACTIVE_FILE" ]; then
+  PICK="$(tr -cd 'a-z0-9_' < "$ACTIVE_FILE")"
+  case "$PICK" in
+    tb3|upload_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+      ROBOT="$PICK" ;;
+    *) echo "[entrypoint] ignoring invalid active robot '$PICK'" ;;
+  esac
+fi
+ROBOT="${ROBOT:-tb3}"
 URDF="/sim/models/${ROBOT}/${ROBOT}.urdf"
+
+# A selected robot whose files vanished must fall back, not crash-loop the container.
+if [ "$ROBOT" != "tb3" ] && [ ! -f "$URDF" ]; then
+  echo "[entrypoint] '$ROBOT' has no URDF at $URDF - falling back to tb3"
+  ROBOT=tb3
+  URDF="/sim/models/tb3/tb3.urdf"
+fi
+echo "[entrypoint] robot: $ROBOT"
 
 # Gazebo will not find ros2_control's system plugin without this on its search path.
 export IGN_GAZEBO_SYSTEM_PLUGIN_PATH="/opt/ros/humble/lib:${IGN_GAZEBO_SYSTEM_PLUGIN_PATH}"
