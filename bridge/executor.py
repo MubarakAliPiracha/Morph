@@ -14,6 +14,7 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
+import nav
 from ros_node import SimNode, wrap_pi
 
 CONTROL_HZ = 20.0
@@ -25,10 +26,14 @@ OBSTACLE_STOP = 0.45  # m, reactive brake distance for `safe`
 
 
 class PlanExecutor:
-    def __init__(self, node: SimNode, world_provider: Callable[[], List[Dict]], kin) -> None:
+    def __init__(self, node: SimNode, world_provider: Callable[[], List[Dict]], kin,
+                 radius: float = 0.25, height: float = 0.5) -> None:
         self.node = node
         self.world = world_provider  # returns the current WorldObject list
         self.kin = kin               # Kinematics bound to the loaded URDF
+        self.radius = radius         # circumscribed footprint radius, for path inflation
+        self.height = height
+        self.inflate = radius + 0.12
         self.revolute = set(kin.arm_joints)
         self.queue: List[Dict] = []
         self.cancel = threading.Event()
@@ -132,8 +137,7 @@ class PlanExecutor:
 
     def _do_drive(self, p: Dict) -> None:
         speed = min(float(p.get("speed", 0.35)), MAX_LINEAR)
-        if p.get("reverse"):
-            speed = -speed
+        reverse = bool(p.get("reverse"))
         distance = p.get("distance")
         until_front = p.get("until_front_within")
         safe = p.get("safe", True)
@@ -142,31 +146,52 @@ class PlanExecutor:
         start_x, start_y, _ = self.node.state.base_2d()
         while self._running(deadline):
             x, y, _ = self.node.state.base_2d()
-            if distance is not None and math.dist((x, y), (start_x, start_y)) >= float(distance):
+            command = speed
+            if distance is not None:
+                remaining = float(distance) - math.dist((x, y), (start_x, start_y))
+                if remaining <= 0:
+                    break
+                # Taper into the target so momentum can't carry the robot past it.
+                command = min(command, 0.8 * remaining + 0.05)
+            if until_front is not None:
+                gap = self._scan_front - float(until_front)
+                if gap <= 0:
+                    break
+                command = min(command, 0.8 * gap + 0.05)
+            if safe and not reverse and self._scan_front <= OBSTACLE_STOP:
                 break
-            if until_front is not None and self._scan_front <= float(until_front):
-                break
-            if safe and speed > 0 and self._scan_front <= OBSTACLE_STOP:
-                break
-            self.node.drive(speed, 0.0)
+            self.node.drive(-command if reverse else command, 0.0)
             self._sleep_tick()
         self.node.halt()
 
     def _do_turn(self, p: Dict) -> None:
         target = math.radians(float(p.get("angle_degrees", 90.0)))
-        deadline = time.time() + min(30.0, abs(target) / 0.5 + 6.0)
+        deadline = time.time() + min(40.0, abs(target) / 0.5 + 8.0)
         _, _, last_yaw = self.node.state.base_2d()
         turned = 0.0
-        direction = 1.0 if target >= 0 else -1.0
+        settle_until = None
 
-        # Accumulate wrapped deltas: a raw yaw difference wraps at +-pi and would stop a
-        # 270-degree turn early.
-        while self._running(deadline) and abs(turned) < abs(target):
+        # `turned` accumulates wrapped deltas so turns beyond 180 degrees work, and the
+        # signed remainder drives a closed loop that corrects overshoot instead of
+        # stopping on the first crossing.
+        while self._running(deadline):
             _, _, yaw = self.node.state.base_2d()
             turned += wrap_pi(yaw - last_yaw)
             last_yaw = yaw
-            remaining = abs(target) - abs(turned)
-            self.node.drive(0.0, direction * min(MAX_ANGULAR, max(0.25, 2.0 * remaining)))
+            remaining = target - turned
+            if abs(remaining) <= math.radians(1.0):
+                if settle_until is None:
+                    self.node.halt()
+                    settle_until = time.time() + 0.25
+                elif time.time() >= settle_until:
+                    break
+                self._sleep_tick()
+                continue
+            settle_until = None
+            angular = max(-MAX_ANGULAR, min(MAX_ANGULAR, 2.2 * remaining))
+            if abs(angular) < 0.12:
+                angular = math.copysign(0.12, angular)
+            self.node.drive(0.0, angular)
             self._sleep_tick()
         self.node.halt()
 
@@ -184,26 +209,114 @@ class PlanExecutor:
         deadline = time.time() + float(p.get("duration", 15.0))
         self._aim(float(p["x"]), float(p["y"]), deadline)
 
+    def _live_object(self, obj_id: Optional[str]) -> Optional[Dict]:
+        if not obj_id:
+            return None
+        return next((o for o in self.world() if o["id"] == obj_id), None)
+
+    def _route(self, target_x: float, target_y: float, target_id: Optional[str],
+               stop_distance: float) -> List[Tuple[float, float]]:
+        """A* waypoints toward the target; falls back to a direct leg when no route
+        exists so an impossible request still ends with an honest best effort."""
+        world = self.world()
+        target_obj = self._live_object(target_id)
+        x, y, _ = self.node.state.base_2d()
+        ignore = [i for i in (self.held_id,) if i]
+        route = nav.plan_path(world, (x, y), (target_x, target_y), self.inflate, self.height,
+                              target_obj=target_obj, stop_distance=stop_distance,
+                              ignore_ids=ignore)
+        if route is None:
+            self.node.get_logger().warn(
+                f"no traversable route to ({target_x:.2f}, {target_y:.2f}); driving direct")
+            return [(target_x, target_y)]
+        if target_obj is not None:
+            route.append((float(target_obj["x"]), float(target_obj["y"])))
+        return route
+
+    def _arrived(self, x: float, y: float, target_x: float, target_y: float,
+                 target_id: Optional[str], stop_distance: float) -> bool:
+        obj = self._live_object(target_id)
+        if obj is not None:
+            # Distance to the footprint EDGE: "0.5 m from the wall" means the surface,
+            # never the center of a 6 m slab.
+            gap = nav.footprint_distance(x, y, obj)
+            return gap <= max(stop_distance, self.radius + 0.12)
+        return math.dist((x, y), (target_x, target_y)) <= max(stop_distance, 0.12)
+
+    def _drive_leg(self, leg_x: float, leg_y: float, speed: float, deadline: float,
+                   final: bool, target_x: float, target_y: float,
+                   target_id: Optional[str], stop_distance: float) -> str:
+        """Drive one straight-ish leg. Returns 'arrived', 'blocked', 'wedged' or 'ended'."""
+        blocked_since = None
+        progress_xy = self.node.state.base_2d()[:2]
+        progress_at = time.time()
+        while self._running(deadline):
+            x, y, yaw = self.node.state.base_2d()
+            if final:
+                if self._arrived(x, y, target_x, target_y, target_id, stop_distance):
+                    return "arrived"
+            elif math.dist((x, y), (leg_x, leg_y)) <= 0.18:
+                return "arrived"
+            error = wrap_pi(math.atan2(leg_y - y, leg_x - x) - yaw)
+            angular = max(-MAX_ANGULAR, min(MAX_ANGULAR, 2.0 * error))
+            remaining = math.dist((x, y), (leg_x, leg_y))
+            # Speed scales with alignment: swinging through corners at full speed is
+            # how the caster climbs a wall edge and beaches the robot.
+            align = max(0.0, 1.0 - abs(error) / 0.5)
+            linear = min(speed, 0.8 * remaining + 0.05) * align
+            # The reactive brake stays on except for the last approach to the target
+            # object itself -- that is the one thing we mean to get close to.
+            brake = 0.18 if (final and target_id) else OBSTACLE_STOP
+            if self._scan_front <= brake and linear > 0:
+                linear = 0.0
+                blocked_since = blocked_since or time.time()
+                if time.time() - blocked_since > 1.2:
+                    return "blocked"
+            else:
+                blocked_since = None
+            # Wedge detection on ground truth: wheels commanded, body not moving.
+            if math.dist((x, y), progress_xy) >= 0.04:
+                progress_xy, progress_at = (x, y), time.time()
+            elif linear > 0.05 and time.time() - progress_at > 2.5:
+                return "wedged"
+            self.node.drive(linear, angular)
+            self._sleep_tick()
+        return "ended"
+
     def _do_go_to(self, p: Dict) -> None:
         target_x, target_y = float(p["x"]), float(p["y"])
         speed = min(float(p.get("speed", 0.4)), MAX_LINEAR)
-        arrive = max(float(p.get("stop_distance", 0.0)), 0.0) + float(p.get("target_radius", 0.0))
-        arrive = max(arrive, 0.12)
+        stop_distance = max(float(p.get("stop_distance", 0.0)), 0.0)
+        target_id = p.get("target_id")
         deadline = time.time() + float(p.get("duration", 90.0))
 
-        self._aim(target_x, target_y, deadline, tolerance=0.15)
-        while self._running(deadline):
-            x, y, yaw = self.node.state.base_2d()
-            remaining = math.dist((x, y), (target_x, target_y))
-            if remaining <= arrive:
+        route = self._route(target_x, target_y, target_id, stop_distance)
+        recoveries = 0
+        while self._running(deadline) and route:
+            leg_x, leg_y = route[0]
+            final = len(route) == 1
+            outcome = self._drive_leg(leg_x, leg_y, speed, deadline, final,
+                                      target_x, target_y, target_id, stop_distance)
+            if outcome == "arrived":
+                route.pop(0)
+            elif outcome in ("blocked", "wedged") and recoveries < 6:
+                recoveries += 1
+                if outcome == "wedged":
+                    self._back_off(deadline)
+                route = self._route(target_x, target_y, target_id, stop_distance)
+            else:
                 break
-            error = wrap_pi(math.atan2(target_y - y, target_x - x) - yaw)
-            angular = max(-MAX_ANGULAR, min(MAX_ANGULAR, 2.0 * error))
-            # Turn in place while badly misaligned, then drive.
-            linear = 0.0 if abs(error) > 0.6 else min(speed, 0.8 * remaining)
-            if self._scan_front <= OBSTACLE_STOP:
-                linear = 0.0
-            self.node.drive(linear, angular)
+        self.node.halt()
+
+    def _back_off(self, deadline: float) -> None:
+        """Reverse ~20 cm to free a beached or cornered robot before replanning."""
+        start_x, start_y, _ = self.node.state.base_2d()
+        end = min(deadline, time.time() + 2.5)
+        while self._running(end):
+            x, y, _ = self.node.state.base_2d()
+            if math.dist((x, y), (start_x, start_y)) >= 0.2:
+                break
+            self.node.drive(-0.2, 0.0)
             self._sleep_tick()
         self.node.halt()
 
@@ -268,15 +381,17 @@ class PlanExecutor:
         snapshot.objects[id], which is exactly this computed pose.
         """
         target_x, target_y = float(p.get("x", 0.0)), float(p.get("y", 0.0))
-        radius = float(p.get("target_radius", 0.25))
-
-        obj = self._nearest_dynamic(target_x, target_y, radius + 0.4)
+        obj = self._live_object(p.get("target_id"))
+        if obj is None:
+            obj = self._nearest_dynamic(target_x, target_y, 0.65)
         if obj is None:
             return
 
         self._gripper(self.kin.gripper_open, 0.4)
-        self._do_go_to({"x": target_x, "y": target_y, "stop_distance": 0.38, "duration": 40.0})
-        self._aim(target_x, target_y, time.time() + 8.0)
+        self._do_go_to({"x": obj["x"], "y": obj["y"], "target_id": obj.get("id"),
+                        "stop_distance": 0.38, "duration": 60.0})
+        obj = self._live_object(obj.get("id")) or obj  # it may have moved while we drove
+        self._aim(obj["x"], obj["y"], time.time() + 8.0)
 
         local = self._world_to_base(obj["x"], obj["y"], obj["z"] + obj["h"] / 2.0)
         solution, _error = self.kin.solve(*local)

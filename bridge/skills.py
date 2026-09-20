@@ -137,7 +137,9 @@ def normalize(steps: List[Dict], mobile: bool, joints: List[Dict], world: List[D
                 if obj is None:
                     warnings.append(f"Skipped '{skill}': there's no object called '{tgt}'.")
                     continue
-                out = {"x": obj["x"], "y": obj["y"], "target_radius": max(obj["w"], obj["d"]) / 2 * 1.05}
+                # target_id lets the executor track the live object and measure arrival
+                # to its footprint edge instead of its (possibly far away) center.
+                out = {"x": obj["x"], "y": obj["y"], "target_id": obj["id"]}
                 if skill == "go_to":
                     out["stop_distance"] = _f(params.get("stop_distance"), 0.5)
             elif _f(params.get("x")) is not None and _f(params.get("y")) is not None:
@@ -151,7 +153,7 @@ def normalize(steps: List[Dict], mobile: bool, joints: List[Dict], world: List[D
         elif skill == "grasp":
             obj = find_object(world, params.get("target", ""))
             if obj is not None:
-                out = {"x": obj["x"], "y": obj["y"], "target_radius": max(obj["w"], obj["d"]) / 2 * 1.05}
+                out = {"x": obj["x"], "y": obj["y"], "target_id": obj["id"]}
             elif not mobile:
                 out = {}
             else:
