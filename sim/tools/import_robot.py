@@ -47,8 +47,12 @@ def resolve_package_uri(uri: str) -> Path | None:
     return candidate if candidate.exists() else None
 
 
-def collect_meshes(root: ET.Element, mesh_dir: Path) -> dict:
-    """Copy every referenced mesh next to the model; return uri -> filename."""
+def collect_meshes(root: ET.Element, mesh_dir: Path, search_root: Path | None = None) -> dict:
+    """Copy every referenced mesh next to the model; return uri -> filename.
+
+    Uploaded robots arrive as a flat file set, so their mesh URIs never resolve as
+    package paths; fall back to a basename search next to the source URDF.
+    """
     mapping = {}
     mesh_dir.mkdir(parents=True, exist_ok=True)
     for mesh in root.iter("mesh"):
@@ -56,6 +60,8 @@ def collect_meshes(root: ET.Element, mesh_dir: Path) -> dict:
         if not uri.lower().endswith((".stl", ".dae", ".obj")):
             continue
         source = resolve_package_uri(uri)
+        if source is None and search_root is not None:
+            source = next(search_root.rglob(Path(uri).name), None)
         if source is None:
             print(f"  ! could not resolve {uri}")
             continue
@@ -195,7 +201,7 @@ def main() -> None:
     root = tree.getroot()
     root.set("name", name)
 
-    mesh_map = collect_meshes(root, out_dir / "meshes")
+    mesh_map = collect_meshes(root, out_dir / "meshes", source.parent)
     print(f"  meshes copied      : {len(mesh_map)}")
 
     removed = strip_classic_gazebo(root)
