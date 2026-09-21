@@ -30,6 +30,7 @@ export type RobotInfo = {
   sensors?: SensorInfo[];
   scale?: { unit_m: number; spawn_x: number; factor: number };
   warnings?: string[];
+  upload_id?: string;
 };
 
 export type Health = { ok: boolean; ollama: boolean; model: string; robot: RobotInfo };
@@ -76,6 +77,11 @@ const json = (body: unknown): RequestInit => ({
 export const api = {
   health: () => request<Health>('/api/health'),
   selectRobot: (source: string) => request<RobotInfo>('/api/robot/select', json({ source })),
+  activateRobot: (source: string) =>
+    request<{ ok: boolean; source: string; rebooting: boolean }>(
+      '/api/robot/activate',
+      json({ source }),
+    ),
   uploadRobot: (files: File[]) => {
     const form = new FormData();
     for (const f of files) {
@@ -89,3 +95,29 @@ export const api = {
   setWorld: (objects: WorldObject[]) => request<{ ok: boolean }>('/api/world', { ...json({ objects }), method: 'PUT' }),
   stop: () => request<{ ok: boolean }>('/api/stop', { method: 'POST' }),
 };
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait out an activation reboot and return whatever robot the sim came back with.
+ *
+ * Two phases on purpose: right after activate, the OLD server still answers for a
+ * second, so "source doesn't match yet" means nothing. Only an answer that either
+ * matches the requested robot or arrives after observed downtime is the new boot —
+ * a non-matching robot then means the entrypoint fell back (broken upload).
+ */
+export async function waitForRobot(source: string, timeoutMs = 240_000): Promise<RobotInfo> {
+  const start = Date.now();
+  let sawDown = false;
+  while (Date.now() - start < timeoutMs) {
+    await sleep(3000);
+    try {
+      const health = await api.health();
+      if (health.robot.source === source) return health.robot;
+      if (sawDown) return health.robot;
+    } catch {
+      sawDown = true;
+    }
+  }
+  throw new Error('The simulator did not come back after the reboot. Check "docker compose logs sim".');
+}

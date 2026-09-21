@@ -239,6 +239,23 @@ def phase_upload(score, n=10):
             ok = len(meshes) == 3 and web == 200 and "6 movable joints" in warning
             detail = f"{uid}: meshes={len(meshes)} web={web} joints-ok={'6 movable joints' in warning}"
         score.add("upload", f"telearm#{i}", ok, detail)
+
+    # The same robot as a single .zip must convert identically.
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name in names:
+            archive.write(f"{fixture}/{name}", name)
+    r = requests.post(BASE + "/api/robot/upload",
+                      files=[("files", ("telearm.zip", buf.getvalue()))], timeout=240)
+    body = r.json() if r.status_code == 200 else {}
+    warning = (body.get("warnings") or [""])[0]
+    ok = r.status_code == 200 and "6 movable joints" in warning and body.get("upload_id")
+    if ok:
+        created.append(body["upload_id"])
+    score.add("upload", "telearm_zip", bool(ok), f"http {r.status_code}: {warning[:80]}")
+
     for uid in created:
         shutil.rmtree(f"/sim/models/{uid}", ignore_errors=True)
 

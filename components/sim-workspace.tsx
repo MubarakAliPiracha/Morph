@@ -24,7 +24,7 @@ import { Logo } from '@/components/logo';
 import { SceneViewport } from '@/components/scene-viewport';
 import { ShapesPanel } from '@/components/shapes-panel';
 import { ViewportToolbar, type Tool } from '@/components/viewport-toolbar';
-import { api, type CommandResult, type Health, type RobotInfo } from '@/lib/api';
+import { api, waitForRobot, type CommandResult, type Health, type RobotInfo } from '@/lib/api';
 import { useSims } from '@/lib/sims';
 import { useRobotSocket } from '@/lib/use-robot-socket';
 import { ConsolePanel } from '@/components/console-panel';
@@ -165,7 +165,24 @@ export function SimWorkspace() {
       setBusy(true);
       setNotice(null);
       try {
-        adoptRobot(await api.uploadRobot(files));
+        const converted = await api.uploadRobot(files);
+        if (!converted.upload_id) {
+          adoptRobot(converted);
+          return;
+        }
+        // The sim boots one robot per container, so activation is a reboot: the
+        // backend goes down and comes back up running the uploaded robot.
+        setNotice(
+          `${converted.warnings?.[0] ?? 'Converted.'} Rebooting the simulator with your robot — about a minute…`,
+        );
+        await api.activateRobot(converted.upload_id);
+        const active = await waitForRobot(converted.upload_id);
+        adoptRobot(active);
+        setNotice(
+          active.source === converted.upload_id
+            ? `${active.name} is live — this is your uploaded robot. Try "drive forward 1 meter".`
+            : 'Your robot converted but failed to boot; the simulator reverted to the TurtleBot. Check "docker compose logs sim".',
+        );
       } catch (e) {
         setNotice((e as Error).message);
       } finally {

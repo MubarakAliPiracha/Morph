@@ -18,11 +18,13 @@ services:
       # Gazebo cannot find ros2_control's system plugin without this.
       IGN_GAZEBO_SYSTEM_PLUGIN_PATH: /opt/ros/humble/lib
       NLROBOT_WORLD: nlworld
-      # One robot per container, picked at boot. Uncomment to drive an uploaded
-      # robot instead of the TurtleBot, then: docker compose up -d --force-recreate
+      # One robot per container, picked at boot. Normally chosen in the UI (upload ->
+      # activate reboots the container); setting NLROBOT_ROBOT here overrides that.
       # NLROBOT_ROBOT: upload_d1080363
     volumes:
       - ./bridge:/app/bridge
       - ./sim:/sim
     shm_size: "1gb"
     stop_grace_period: 5s
+    # /api/robot/activate reboots the sim by exiting PID 1; this brings it back up.
+    restart: unless-stopped

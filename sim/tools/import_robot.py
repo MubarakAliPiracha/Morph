@@ -115,6 +115,82 @@ def mimic_joints(root: ET.Element) -> set:
     return {j.get("name") for j in root.findall("joint") if j.find("mimic") is not None}
 
 
+def wheel_radius_of(link: ET.Element) -> float | None:
+    """Radius from the wheel link's primitive geometry.
+
+    `find(a) or find(b)` is a trap here: a childless Element is falsy, so a found
+    <cylinder/> would fall through to the next lookup. Explicit None checks only.
+    """
+    for expr in (".//collision/geometry/cylinder", ".//visual/geometry/cylinder",
+                 ".//collision/geometry/sphere", ".//visual/geometry/sphere"):
+        found = link.find(expr)
+        if found is not None and found.get("radius"):
+            return float(found.get("radius"))
+    return None
+
+
+def mean_wheel_y(root: ET.Element, names: list) -> float | None:
+    """Average lateral offset of the named wheel joints, for wheel_separation."""
+    offsets = []
+    for joint in root.findall("joint"):
+        if joint.get("name") not in names:
+            continue
+        origin = joint.find("origin")
+        xyz = (origin.get("xyz", "0 0 0") if origin is not None else "0 0 0").split()
+        if len(xyz) > 1:
+            offsets.append(float(xyz[1]))
+    return sum(offsets) / len(offsets) if offsets else None
+
+
+def find_wheels(root: ET.Element) -> tuple:
+    """Drive wheels split into (left, right) by the y-sign of each joint origin.
+
+    Document order is meaningless -- a URDF listing the right wheel first would get
+    inverted steering, every turn going the wrong way. Left is +y in URDF convention.
+    """
+    candidates = []
+    for joint in root.findall("joint"):
+        if joint.get("type") != "continuous":
+            continue
+        origin = joint.find("origin")
+        xyz = (origin.get("xyz", "0 0 0") if origin is not None else "0 0 0").split()
+        y = float(xyz[1]) if len(xyz) > 1 else 0.0
+        candidates.append((joint.get("name") or "", y))
+    named = [c for c in candidates if "wheel" in c[0].lower()]
+    if named:
+        candidates = named
+    elif len(candidates) != 2:
+        return [], []  # without the name hint, only an unambiguous pair is safe to drive
+    left = [n for n, y in candidates if y > 0]
+    right = [n for n, y in candidates if y < 0]
+    if not left or not right:
+        if len(candidates) == 2:  # e.g. origins live on the links; trust document order
+            return [candidates[0][0]], [candidates[1][0]]
+        return [], []
+    return left, right
+
+
+def ensure_ros2_control(root: ET.Element, wheels: set) -> bool:
+    """Plain URDFs carry no <ros2_control> block at all; without one gz_ros2_control
+    loads nothing and every uploaded arm is frozen decoration. Synthesize a block over
+    the non-wheel movable joints so retargeting can treat every robot the same way."""
+    if root.findall("ros2_control"):
+        return False
+    mimics = mimic_joints(root)
+    movable = [j.get("name") for j in root.findall("joint")
+               if j.get("type") in ("revolute", "prismatic")
+               and j.get("name") not in wheels | mimics]
+    if not movable:
+        return False
+    control = ET.SubElement(root, "ros2_control",
+                            {"name": "GazeboSimSystem", "type": "system"})
+    hardware = ET.SubElement(control, "hardware")
+    ET.SubElement(hardware, "plugin").text = "gz_ros2_control/GazeboSimSystem"
+    for name in movable:
+        ET.SubElement(control, "joint", {"name": name})
+    return True
+
+
 def retarget_ros2_control(root: ET.Element, wheels: set) -> list:
     """Point ros2_control at the Gazebo system, and hand the wheels to DiffDrive."""
     mimics = mimic_joints(root)
@@ -143,27 +219,35 @@ def retarget_ros2_control(root: ET.Element, wheels: set) -> list:
     return controlled
 
 
-def add_fortress_systems(root: ET.Element, name: str, wheels: list, separation: float, radius: float) -> None:
-    block = ET.SubElement(root, "gazebo")
-    diff = ET.SubElement(block, "plugin", {
-        "filename": "ignition-gazebo-diff-drive-system",
-        "name": "ignition::gazebo::systems::DiffDrive",
-    })
-    for tag, value in (
-        ("left_joint", wheels[0]), ("right_joint", wheels[1]),
-        ("wheel_separation", str(separation)), ("wheel_radius", str(radius)),
-        ("odom_publish_frequency", "50"),
-        ("topic", f"/model/{name}/cmd_vel"), ("odom_topic", f"/model/{name}/odometry"),
-        ("frame_id", "odom"), ("child_frame_id", "base_link"),
-    ):
-        ET.SubElement(diff, tag).text = value
+def add_fortress_systems(root: ET.Element, name: str, left: list, right: list,
+                         separation: float, radius: float, has_control: bool) -> None:
+    if left and right:
+        block = ET.SubElement(root, "gazebo")
+        diff = ET.SubElement(block, "plugin", {
+            "filename": "ignition-gazebo-diff-drive-system",
+            "name": "ignition::gazebo::systems::DiffDrive",
+        })
+        # Repeated joint tags are the skid-steer pattern: DiffDrive drives every
+        # wheel on a side together, so 4- and 6-wheel bases work unchanged.
+        for wheel in left:
+            ET.SubElement(diff, "left_joint").text = wheel
+        for wheel in right:
+            ET.SubElement(diff, "right_joint").text = wheel
+        for tag, value in (
+            ("wheel_separation", str(separation)), ("wheel_radius", str(radius)),
+            ("odom_publish_frequency", "50"),
+            ("topic", f"/model/{name}/cmd_vel"), ("odom_topic", f"/model/{name}/odometry"),
+            ("frame_id", "odom"), ("child_frame_id", "base_link"),
+        ):
+            ET.SubElement(diff, tag).text = value
 
-    control_block = ET.SubElement(root, "gazebo")
-    control = ET.SubElement(control_block, "plugin", {
-        "filename": "gz_ros2_control-system",
-        "name": "gz_ros2_control::GazeboSimROS2ControlPlugin",
-    })
-    ET.SubElement(control, "parameters").text = f"/sim/config/{name}_controllers.yaml"
+    if has_control:
+        control_block = ET.SubElement(root, "gazebo")
+        control = ET.SubElement(control_block, "plugin", {
+            "filename": "gz_ros2_control-system",
+            "name": "gz_ros2_control::GazeboSimROS2ControlPlugin",
+        })
+        ET.SubElement(control, "parameters").text = f"/sim/config/{name}_controllers.yaml"
 
 
 def write_controllers_yaml(path: Path, joints: list) -> None:
@@ -201,7 +285,8 @@ def main() -> None:
     root = tree.getroot()
     root.set("name", name)
 
-    mesh_map = collect_meshes(root, out_dir / "meshes", source.parent)
+    search_root = Path(sys.argv[4]) if len(sys.argv) > 4 else source.parent
+    mesh_map = collect_meshes(root, out_dir / "meshes", search_root)
     print(f"  meshes copied      : {len(mesh_map)}")
 
     removed = strip_classic_gazebo(root)
@@ -211,30 +296,36 @@ def main() -> None:
     for reference, sensor_name, kind in sensors:
         print(f"  sensor kept        : {sensor_name} ({kind}) on {reference}")
 
-    wheels = [j.get("name") for j in root.findall("joint")
-              if j.get("type") == "continuous" and "wheel" in (j.get("name") or "")]
-    controlled = retarget_ros2_control(root, set(wheels))
+    left, right = find_wheels(root)
+    wheels = set(left) | set(right)
+    if not wheels:
+        print("  diff drive         : no drive wheels found; robot will be stationary")
+    if ensure_ros2_control(root, wheels):
+        print("  ros2_control       : none declared; synthesized over movable joints")
+    controlled = retarget_ros2_control(root, wheels)
     print(f"  ros2_control joints: {controlled}")
 
     # Wheel geometry, read off the URDF rather than hardcoded.
     separation, radius = 0.287, 0.033
-    origins = []
-    for joint in root.findall("joint"):
-        if joint.get("name") in wheels:
-            origin = joint.find("origin")
-            if origin is not None:
-                origins.append([float(v) for v in origin.get("xyz", "0 0 0").split()])
-    if len(origins) == 2:
-        separation = round(abs(origins[0][1] - origins[1][1]), 4)
+    left_y = mean_wheel_y(root, left)
+    right_y = mean_wheel_y(root, right)
+    if left_y is not None and right_y is not None and left_y != right_y:
+        separation = round(abs(left_y - right_y), 4)
+    # The wheel link is the JOINT'S CHILD -- never guessable from the joint's name.
+    wheel_links = {joint.find("child").get("link") for joint in root.findall("joint")
+                   if joint.get("name") in wheels and joint.find("child") is not None}
     for link in root.findall("link"):
-        if link.get("name") in (w.replace("_joint", "_link") for w in wheels):
-            cylinder = link.find(".//collision/geometry/cylinder") or link.find(".//visual/geometry/cylinder")
-            if cylinder is not None:
-                radius = float(cylinder.get("radius"))
-    print(f"  diff drive         : separation={separation} radius={radius} wheels={wheels}")
+        if link.get("name") not in wheel_links:
+            continue
+        detected = wheel_radius_of(link)
+        if detected:
+            radius = detected
+            break
+    print(f"  diff drive         : separation={separation} radius={radius} left={left} right={right}")
 
-    add_fortress_systems(root, name, wheels, separation, radius)
-    write_controllers_yaml(Path("/sim/config") / f"{name}_controllers.yaml", controlled)
+    add_fortress_systems(root, name, left, right, separation, radius, bool(controlled))
+    if controlled:
+        write_controllers_yaml(Path("/sim/config") / f"{name}_controllers.yaml", controlled)
 
     # Sim copy: absolute mesh paths Gazebo can open directly.
     for mesh in root.iter("mesh"):

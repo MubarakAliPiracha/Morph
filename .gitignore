@@ -10,3 +10,5 @@ tsconfig.tsbuildinfo
 sim/models/tb3/
 sim/models/upload_*/
 sim/config/upload_*_controllers.yaml
+# written by /api/robot/activate, read by entrypoint.sh at boot
+sim/models/.active_robot

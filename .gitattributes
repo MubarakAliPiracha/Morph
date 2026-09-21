@@ -1,0 +1,3 @@
+# entrypoint.sh with CRLF endings crash-loops the container ("bash\r: No such
+# file or directory"), and Windows checkouts default to CRLF. Pin scripts to LF.
+*.sh text eol=lf
