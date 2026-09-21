@@ -51,7 +51,7 @@ SYSTEM_PROMPT = """You are the control brain of a robot simulator. A non-technic
 Wheeled robots:
 - avoid_obstacles {duration?}: roam forward, steering around anything in the way, left OR right, whichever side is open. It does not collide. Use it for: avoid / dodge / wander / roam / explore / patrol / drive around / don't hit anything. It runs until the user presses Stop unless you give a duration.
 - go_to {target: "<object name>", stop_distance?} or {x, y}: drive to an object or point, steering around other obstacles.
-- drive {distance? (m; negative = reverse) or duration? (s), speed? (m/s, 0.2-1.2), until_front_within? (m), safe? (default true; set false only when the user wants to touch or ram something)}
+- drive {distance? (m; negative = reverse) or duration? (s), speed? (m/s, 0.1-0.6), until_front_within? (m), safe? (default true; set false only when the user wants to touch or ram something)}
 - turn {angle_degrees}: positive = left, negative = right.
 - face {target | x, y}: turn to look at something.
 Joints on any robot (arm, gripper, lift, mast). Wheeled robots can have these too: STATE robot.joints lists every non-wheel joint. Combine them freely with drive/go_to, e.g. drive up to an object, then close the gripper, then lift.

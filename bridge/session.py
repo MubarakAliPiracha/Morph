@@ -10,6 +10,7 @@ Public surface kept identical to the original:
 """
 
 import math
+import subprocess
 import threading
 import time
 from typing import Dict, List, Optional
@@ -91,16 +92,41 @@ class Session:
         self.state = LatestState()
         self.node: SimNode = start_ros(self.state)
         self.vehicle = Vehicle(self)
-        self.executor = PlanExecutor(self.node, lambda: self.scan_world(), self.kin)
+        self.executor = PlanExecutor(self.node, lambda: self.scan_world(), self.kin,
+                                     radius=self.vehicle.radius, height=self.vehicle.height)
 
         # Fallback joint pose. If gz_ros2_control fails to load, /joint_states never
         # publishes and the viewport would draw the arm in T-pose through the floor --
         # which reads as a viewport bug rather than a missing controller.
         self._default_joints = {**self.kin.home, **self.kin.gripper(self.kin.gripper_open)}
         self._spawned: Dict[str, Dict] = {}
+        self._collect_strays()  # a previous backend run may have left models behind
         threading.Thread(target=self._pump, daemon=True, name="session-pump").start()
 
     # ---------- world ----------
+
+    def _collect_strays(self) -> None:
+        """Delete every Gazebo model this session doesn't own.
+
+        `_spawned` lives in memory, so a backend restart orphans whatever was in the
+        world: physically present, absent from every scan and viewport. An invisible
+        wall is the single worst accuracy bug this product can have.
+        """
+        try:
+            done = subprocess.run(
+                ["bash", "-lc", "source /opt/ros/humble/setup.bash && ign model --list"],
+                capture_output=True, text=True, timeout=20,
+            )
+            models = [line.strip()[2:].strip() for line in done.stdout.splitlines()
+                      if line.strip().startswith("- ")]
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.node.get_logger().warn(f"stray sweep failed: {exc}")
+            return
+        keep = {"ground_plane", ROBOT_NAME, *self._spawned}
+        for name in models:
+            if name not in keep:
+                self.node.get_logger().warn(f"removing stray model '{name}'")
+                self.node.delete(name)
 
     def world_snapshot(self) -> List[Dict]:
         with self.lock:
@@ -165,8 +191,9 @@ class Session:
                 sensor = self.sensor_block()
                 self.executor.set_scan(sensor["front"], sensor["dist"])
                 self.node.publish_scan(sensor)
-            except Exception:
-                pass
+            except Exception as exc:
+                # A silently frozen scan is a blind robot with no symptom -- always log.
+                self.node.get_logger().warn(f"scan pump failed: {exc}")
             time.sleep(0.1)
 
     def snapshot(self) -> Dict:
@@ -229,6 +256,7 @@ class Session:
         for obj_id in list(self._spawned):
             self.node.delete(obj_id)
         self._spawned.clear()
+        self._collect_strays()
         self.executor.held_id = None
         self.node.set_pose(ROBOT_NAME, 0.0, 0.0, 0.06, 0.0)
         time.sleep(0.3)  # let the teleport land before declaring the new odometry zero

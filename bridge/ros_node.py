@@ -37,7 +37,8 @@ from tf2_msgs.msg import TFMessage
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 WORLD_NAME = os.environ.get("NLROBOT_WORLD", "nlworld")
-ROBOT_NAME = "nlbot"
+# The spawned model's name (entrypoint.sh: `ros2 run ros_gz_sim create -name "$ROBOT"`).
+ROBOT_MODEL = os.environ.get("NLROBOT_ROBOT", "tb3")
 
 
 def quat_to_yaw(x: float, y: float, z: float, w: float) -> float:
@@ -69,6 +70,12 @@ class LatestState:
         # odometry -- it is integrated wheel motion -- so without this the robot keeps
         # rendering at its pre-reset pose and every later plan drives from a stale frame.
         self._odo_zero = (0.0, 0.0, 0.0)  # x, y, yaw subtracted from every reading
+        # Ground-truth pose from Gazebo. Integrated odometry drifts on wheel slip
+        # (contact, tight turns) while world objects live in the WORLD frame; every
+        # consumer of base pose prefers this and falls back to odometry only when the
+        # pose bridge is silent.
+        self._truth: Optional[Tuple[List[float], List[float]]] = None
+        self._truth_at = 0.0
 
     def set_joints(self, names, positions) -> None:
         with self._lock:
@@ -88,6 +95,17 @@ class LatestState:
             if twist is not None:
                 self.base_twist = [float(twist[0]), float(twist[1])]
             self.have_odom = True
+
+    def set_truth(self, pos: List[float], quat: List[float]) -> None:
+        with self._lock:
+            self._truth = (list(pos), list(quat))
+            self._truth_at = time.time()
+
+    def _current(self) -> Tuple[List[float], List[float]]:
+        """Ground truth when fresh, odometry otherwise. Callers hold the lock."""
+        if self._truth is not None and time.time() - self._truth_at < 0.6:
+            return self._truth
+        return self.base_pos, self.base_quat
 
     def rebase_odometry(self) -> None:
         """Declare the robot's CURRENT odometry pose to be the origin (used by reset)."""
@@ -129,13 +147,20 @@ class LatestState:
         with self._lock:
             return {k: round(v, 5) for k, v in self.joints.items()}
 
-    def base_2d(self) -> Tuple[float, float, float]:
+    def odom_2d(self) -> Tuple[float, float, float]:
+        """Raw rebased odometry, kept visible so drift stays measurable."""
         with self._lock:
             return self.base_pos[0], self.base_pos[1], quat_to_yaw(*self.base_quat)
 
+    def base_2d(self) -> Tuple[float, float, float]:
+        with self._lock:
+            pos, quat = self._current()
+            return pos[0], pos[1], quat_to_yaw(*quat)
+
     def base_full(self) -> Tuple[List[float], List[float]]:
         with self._lock:
-            return list(self.base_pos), list(self.base_quat)
+            pos, quat = self._current()
+            return list(pos), list(quat)
 
     def poses_for(self, ids) -> Dict[str, List[float]]:
         with self._lock:
@@ -198,6 +223,8 @@ class SimNode(Node):
     def _on_poses(self, msg: TFMessage) -> None:
         for tf in msg.transforms:
             t, r = tf.transform.translation, tf.transform.rotation
+            if tf.child_frame_id == ROBOT_MODEL:
+                self.state.set_truth([t.x, t.y, t.z], [r.x, r.y, r.z, r.w])
             self.state.set_model_pose(
                 tf.child_frame_id,
                 [round(t.x, 3), round(t.y, 3), round(t.z, 3),
@@ -289,6 +316,19 @@ class SimNode(Node):
         pose.orientation.z, pose.orientation.w = qz, qw
         return pose
 
+    def _call_blocking(self, client, request, timeout: float = 5.0) -> bool:
+        """Wait for the service response (the spinning executor thread completes it).
+
+        Spawn and delete MUST be ordered: fire-and-forget lets a delete overtake an
+        in-flight spawn during rapid world edits, orphaning an invisible model that
+        physically blocks the robot while no scan or viewport shows it.
+        """
+        future = client.call_async(request)
+        end = time.time() + timeout
+        while not future.done() and time.time() < end:
+            time.sleep(0.01)
+        return future.done()
+
     def spawn(self, name: str, sdf_xml: str, x: float, y: float, z: float, yaw: float) -> bool:
         if not self.spawn_cli.wait_for_service(timeout_sec=3.0):
             return False
@@ -301,7 +341,9 @@ class SimNode(Node):
         req.entity_factory = factory
         self.log_command(f"ros2 service call /world/{WORLD_NAME}/create "
                          f"ros_gz_interfaces/srv/SpawnEntity  # model '{name}'", kind="service")
-        self.spawn_cli.call_async(req)
+        if not self._call_blocking(self.spawn_cli, req):
+            self.get_logger().warn(f"spawn of '{name}' got no response")
+            return False
         return True
 
     def delete(self, name: str) -> bool:
@@ -314,7 +356,9 @@ class SimNode(Node):
         req.entity = entity
         self.log_command(f"ros2 service call /world/{WORLD_NAME}/remove "
                          f"ros_gz_interfaces/srv/DeleteEntity  # model '{name}'", kind="service")
-        self.delete_cli.call_async(req)
+        if not self._call_blocking(self.delete_cli, req):
+            self.get_logger().warn(f"delete of '{name}' got no response")
+            return False
         return True
 
     def set_pose(self, name: str, x: float, y: float, z: float, yaw: float) -> bool:
